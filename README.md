@@ -31,6 +31,37 @@ There is a CLI for looking at a response:
 cargo run -- image.png --to ru
 ```
 
+## Using your own HTTP client
+
+`LensClient` is a convenience, not the interface. If you already have an HTTP
+client with your own proxy settings, timeouts, cancellation and a test double,
+use the four pieces directly and skip it:
+
+```rust
+use chrome_lens_ocr::{
+    image_processor::{self, AlphaMode},
+    parse_response_bytes, request_body, request_headers,
+    DEFAULT_API_KEY, LENS_CRUPLOAD_ENDPOINT,
+};
+
+let image = image_processor::process_image_from_bytes(png, AlphaMode::Contrast)?;
+let body = request_body(&image, &options)?;
+let headers = request_headers(DEFAULT_API_KEY);   // (name, value) pairs
+
+let reply = your_client.post(LENS_CRUPLOAD_ENDPOINT, headers, body)?;
+let page = parse_response_bytes(&reply, image.width, image.height)?;
+```
+
+`objects_request` gives you the `LensOverlayServerRequest` itself if you want to
+inspect or amend it before encoding.
+
+Two things the crate deliberately leaves to you: `request_headers` returns no
+transport headers, so `Accept-Encoding` and `Content-Length` are your client's
+business — and `parse_response_bytes` wants the **decompressed** body, because
+a client that advertised gzip and handed back the compressed bytes fails there
+as a protobuf error, which is a confusing way to learn about a
+`Content-Encoding`.
+
 ## Where this came from
 
 A fork of [KolbyML/chrome-lens-ocr](https://github.com/KolbyML/chrome-lens-ocr),

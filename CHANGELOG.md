@@ -34,8 +34,13 @@ sends and reads. Everything below is measured against
   no-op carries an empty or echoed string that is worse than nothing.
 - `ScanOptions` for the OCR language, translation target and source, client
   region and time zone, and the alpha mode.
-- `objects_request` is public, so the request can be inspected or diffed
-  against another implementation's.
+- **The request can be built without being sent**, for callers that already
+  have an HTTP client they want to keep using - their own proxy settings,
+  timeouts, cancellation and test doubles. `objects_request`, `request_body`,
+  `request_headers` and `parse_response_bytes` are free functions; `LensClient`
+  is a convenience built on them rather than the way in.
+  `request_headers` returns name/value pairs and deliberately no transport
+  headers, and `parse_response_bytes` wants a decompressed body.
 - `cargo run --bin update-protos` re-pins the vendored protos to a Chromium ref.
 - 25 tests, over request construction, the response parse and the image rules.
 

@@ -28,13 +28,15 @@ pub mod constants;
 pub mod image_processor;
 pub mod proto;
 
+pub use crate::constants::{DEFAULT_API_KEY, LENS_CRUPLOAD_ENDPOINT};
+
 use std::f32::consts::PI;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use prost::Message;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::constants::*;
 use crate::image_processor::{AlphaMode, ProcessedImage};
@@ -186,98 +188,138 @@ impl LensClient {
         })
     }
 
-    /// The request Chromium's lens overlay would send for this image.
+    /// The headers this client's requests carry, as name/value pairs.
     ///
-    /// Public so a caller can inspect or diff the bytes; nothing else needs it.
+    /// See the free [`request_headers`] for what is and is not in here.
     #[must_use]
-    pub fn objects_request(
-        &self,
-        image: &ProcessedImage,
-        options: &ScanOptions,
-    ) -> LensOverlayServerRequest {
-        let request_id = LensOverlayRequestId {
-            uuid: Some(rand::random::<u64>() >> 1),
-            sequence_id: Some(1),
-            image_sequence_id: Some(1),
-            time_usec: Some(now_usec()),
-            // `mime_type` stays unset: Chromium states it only for a
-            // WebP-with-alpha upload, and ours is always JPEG.
-            ..Default::default()
-        };
+    pub fn headers(&self) -> Vec<(&'static str, String)> {
+        request_headers(&self.api_key)
+    }
 
-        // Chromium always sends exactly one filter, and TRANSLATE *replaces*
-        // AUTO_FILTER rather than joining it. Sending none - which this crate
-        // used to do, leaving translation unreachable - is a state real Chrome
-        // never produces.
-        let filter = match &options.target_language {
-            Some(target) => AppliedFilter {
-                filter_type: Some(LensOverlayFilterType::Translate as i32),
-                filter_payload: Some(applied_filter::FilterPayload::Translate(
-                    applied_filter::Translate {
-                        target_language: Some(target.clone()),
-                        source_language: options.source_language.clone(),
-                    },
-                )),
-            },
-            None => AppliedFilter {
-                filter_type: Some(LensOverlayFilterType::AutoFilter as i32),
-                filter_payload: None,
-            },
-        };
+    /// The API key these requests are sent with.
+    #[must_use]
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+}
 
-        let client_context = LensOverlayClientContext {
-            platform: Platform::Web as i32,
-            surface: Surface::Chromium as i32,
-            locale_context: Some(LocaleContext {
-                language: options
-                    .ocr_language
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_OCR_LANG.to_owned()),
-                region: options
-                    .client_region
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_CLIENT_REGION.to_owned()),
-                time_zone: options
-                    .client_time_zone
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_CLIENT_TIME_ZONE.to_owned()),
-            }),
-            client_filters: Some(AppliedFilters {
-                filter: vec![filter],
-            }),
-            // Chromium's shipping path pairs SURFACE_CHROMIUM/PLATFORM_WEB with
-            // this rendering environment (LensOverlayQueryController::
-            // CreateClientContext). Note it never sets app_id, despite the
-            // proto marking it required.
-            rendering_context: Some(RenderingContext {
-                rendering_environment: LensRenderingEnvironment::RenderingEnvLensOverlay as i32,
-            }),
-            ..Default::default()
-        };
+/// The request Chromium's lens overlay would send for this image.
+///
+/// Free rather than a method on [`LensClient`], because sending it is the part
+/// a caller is most likely to want to do itself - through its own HTTP client,
+/// with its own proxy settings, timeouts and cancellation. Pair it with
+/// [`request_body`], [`request_headers`] and [`parse_response_bytes`] and
+/// [`LensClient`] is not needed at all.
+#[must_use]
+pub fn objects_request(image: &ProcessedImage, options: &ScanOptions) -> LensOverlayServerRequest {
+    let request_id = LensOverlayRequestId {
+        uuid: Some(rand::random::<u64>() >> 1),
+        sequence_id: Some(1),
+        image_sequence_id: Some(1),
+        time_usec: Some(now_usec()),
+        // `mime_type` stays unset: Chromium states it only for a
+        // WebP-with-alpha upload, and ours is always JPEG.
+        ..Default::default()
+    };
 
-        LensOverlayServerRequest {
-            objects_request: Some(LensOverlayObjectsRequest {
-                request_context: Some(LensOverlayRequestContext {
-                    request_id: Some(request_id),
-                    client_context: Some(client_context),
+    // Chromium always sends exactly one filter, and TRANSLATE *replaces*
+    // AUTO_FILTER rather than joining it. Sending none - which this crate
+    // used to do, leaving translation unreachable - is a state real Chrome
+    // never produces.
+    let filter = match &options.target_language {
+        Some(target) => AppliedFilter {
+            filter_type: Some(LensOverlayFilterType::Translate as i32),
+            filter_payload: Some(applied_filter::FilterPayload::Translate(
+                applied_filter::Translate {
+                    target_language: Some(target.clone()),
+                    source_language: options.source_language.clone(),
+                },
+            )),
+        },
+        None => AppliedFilter {
+            filter_type: Some(LensOverlayFilterType::AutoFilter as i32),
+            filter_payload: None,
+        },
+    };
+
+    let client_context = LensOverlayClientContext {
+        platform: Platform::Web as i32,
+        surface: Surface::Chromium as i32,
+        locale_context: Some(LocaleContext {
+            language: options
+                .ocr_language
+                .clone()
+                .unwrap_or_else(|| DEFAULT_OCR_LANG.to_owned()),
+            region: options
+                .client_region
+                .clone()
+                .unwrap_or_else(|| DEFAULT_CLIENT_REGION.to_owned()),
+            time_zone: options
+                .client_time_zone
+                .clone()
+                .unwrap_or_else(|| DEFAULT_CLIENT_TIME_ZONE.to_owned()),
+        }),
+        client_filters: Some(AppliedFilters {
+            filter: vec![filter],
+        }),
+        // Chromium's shipping path pairs SURFACE_CHROMIUM/PLATFORM_WEB with
+        // this rendering environment (LensOverlayQueryController::
+        // CreateClientContext). Note it never sets app_id, despite the
+        // proto marking it required.
+        rendering_context: Some(RenderingContext {
+            rendering_environment: LensRenderingEnvironment::RenderingEnvLensOverlay as i32,
+        }),
+        ..Default::default()
+    };
+
+    LensOverlayServerRequest {
+        objects_request: Some(LensOverlayObjectsRequest {
+            request_context: Some(LensOverlayRequestContext {
+                request_id: Some(request_id),
+                client_context: Some(client_context),
+            }),
+            image_data: Some(ImageData {
+                payload: Some(ImagePayload {
+                    image_bytes: image.bytes.clone(),
                 }),
-                image_data: Some(ImageData {
-                    payload: Some(ImagePayload {
-                        image_bytes: image.bytes.clone(),
-                    }),
-                    image_metadata: Some(ImageMetadata {
-                        width: image.width,
-                        height: image.height,
-                        ..Default::default()
-                    }),
+                image_metadata: Some(ImageMetadata {
+                    width: image.width,
+                    height: image.height,
                     ..Default::default()
                 }),
                 ..Default::default()
             }),
             ..Default::default()
-        }
+        }),
+        ..Default::default()
     }
+}
 
+/// The encoded request body, ready to POST to [`LENS_CRUPLOAD_ENDPOINT`].
+pub fn request_body(image: &ProcessedImage, options: &ScanOptions) -> Result<Vec<u8>> {
+    let request = objects_request(image, options);
+    let mut body = Vec::with_capacity(image.bytes.len() + 512);
+    request.encode(&mut body).context("encoding the request")?;
+    Ok(body)
+}
+
+/// The headers Chromium sends with a `crupload` request, as name/value pairs.
+///
+/// Transport headers are deliberately absent: `Accept-Encoding`,
+/// `Content-Length` and anything to do with connection reuse belong to
+/// whichever HTTP client sends this, and a client that is told to accept gzip
+/// but does not decompress it will hand back bytes that fail to parse.
+#[must_use]
+pub fn request_headers(api_key: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("content-type", "application/x-protobuf".to_owned()),
+        ("accept", "*/*".to_owned()),
+        ("user-agent", DEFAULT_USER_AGENT.to_owned()),
+        ("x-goog-api-key", api_key.to_owned()),
+    ]
+}
+
+impl LensClient {
     pub async fn scan_path<P: AsRef<Path>>(&self, path: P, options: &ScanOptions) -> Result<Page> {
         let image = image_processor::process_image_from_path(path, options.alpha_mode)?;
         self.scan_processed(&image, options).await
@@ -293,23 +335,16 @@ impl LensClient {
         image: &ProcessedImage,
         options: &ScanOptions,
     ) -> Result<Page> {
-        let request = self.objects_request(image, options);
-        let mut payload = Vec::with_capacity(image.bytes.len() + 512);
-        request
-            .encode(&mut payload)
-            .context("encoding the request")?;
+        let payload = request_body(image, options)?;
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/x-protobuf"),
-        );
-        headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
-        headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
-        headers.insert(
-            "X-Goog-Api-Key",
-            HeaderValue::from_str(&self.api_key).context("the API key is not a valid header")?,
-        );
+        for (name, value) in request_headers(&self.api_key) {
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_str(&value)
+                    .with_context(|| format!("{name} is not a valid header value"))?,
+            );
+        }
 
         log::debug!(
             "POST {} ({} bytes, image {}x{})",
@@ -340,9 +375,7 @@ impl LensClient {
             );
         }
 
-        let decoded = LensOverlayServerResponse::decode(body)
-            .context("decoding Lens's reply as a LensOverlayServerResponse")?;
-        parse_response(&decoded, image.width, image.height)
+        parse_response_bytes(&body, image.width, image.height)
     }
 
     /// OCR only, by path. Kept for callers written against the older API;
@@ -457,6 +490,18 @@ fn successful_translations(objects: &LensOverlayObjectsResponse) -> Vec<String> 
         .collect()
 }
 
+/// Decode a `crupload` response body and turn it into a [`Page`].
+///
+/// The counterpart to [`request_body`], for a caller that does its own HTTP.
+/// Pass the raw, *decompressed* body: a client that advertised gzip and handed
+/// back the compressed bytes fails here with a protobuf error, which is a
+/// confusing way to learn about a `Content-Encoding`.
+pub fn parse_response_bytes(body: &[u8], image_width: i32, image_height: i32) -> Result<Page> {
+    let decoded = LensOverlayServerResponse::decode(body)
+        .context("decoding Lens's reply as a LensOverlayServerResponse")?;
+    parse_response(&decoded, image_width, image_height)
+}
+
 /// Turn a decoded response into a [`Page`].
 ///
 /// `image_width`/`image_height` are the dimensions of the image as uploaded;
@@ -546,8 +591,7 @@ mod tests {
 
     #[test]
     fn a_plain_scan_sends_exactly_one_auto_filter() {
-        let client = LensClient::new(None);
-        let request = client.objects_request(&image(), &ScanOptions::default());
+        let request = objects_request(&image(), &ScanOptions::default());
         let filters = &context_of(&request).client_filters.as_ref().unwrap().filter;
 
         assert_eq!(filters.len(), 1, "Chromium sends exactly one filter");
@@ -560,8 +604,7 @@ mod tests {
 
     #[test]
     fn a_translate_scan_replaces_auto_filter_rather_than_joining_it() {
-        let client = LensClient::new(None);
-        let request = client.objects_request(
+        let request = objects_request(
             &image(),
             &ScanOptions::default()
                 .translate_to("ru")
@@ -584,8 +627,7 @@ mod tests {
 
     #[test]
     fn the_rendering_environment_is_the_one_chromium_pairs_with_this_surface() {
-        let client = LensClient::new(None);
-        let request = client.objects_request(&image(), &ScanOptions::default());
+        let request = objects_request(&image(), &ScanOptions::default());
         let context = context_of(&request);
 
         assert_eq!(context.platform, Platform::Web as i32);
@@ -604,8 +646,7 @@ mod tests {
 
     #[test]
     fn no_ocr_language_means_an_empty_string_not_en() {
-        let client = LensClient::new(None);
-        let request = client.objects_request(&image(), &ScanOptions::default());
+        let request = objects_request(&image(), &ScanOptions::default());
         let locale = context_of(&request).locale_context.as_ref().unwrap();
 
         assert_eq!(locale.language, "");
@@ -618,7 +659,6 @@ mod tests {
         // The field has implicit presence, so the default-valued case must
         // serialize to nothing. This is what the proto3/proto2 split in
         // build.rs buys, and what an all-proto2 mapping would silently break.
-        let client = LensClient::new(None);
         let with_nothing = LocaleContext {
             language: String::new(),
             region: String::new(),
@@ -626,7 +666,7 @@ mod tests {
         };
         assert_eq!(with_nothing.encoded_len(), 0);
 
-        let request = client.objects_request(&image(), &ScanOptions::default());
+        let request = objects_request(&image(), &ScanOptions::default());
         let locale = context_of(&request).locale_context.as_ref().unwrap();
         let mut bytes = Vec::new();
         locale.encode(&mut bytes).unwrap();
@@ -640,8 +680,7 @@ mod tests {
 
     #[test]
     fn the_request_id_carries_a_timestamp_and_a_positive_uuid() {
-        let client = LensClient::new(None);
-        let request = client.objects_request(&image(), &ScanOptions::default());
+        let request = objects_request(&image(), &ScanOptions::default());
         let id = request
             .objects_request
             .as_ref()
@@ -662,8 +701,7 @@ mod tests {
 
     #[test]
     fn the_image_goes_in_with_its_uploaded_dimensions() {
-        let client = LensClient::new(None);
-        let request = client.objects_request(&image(), &ScanOptions::default());
+        let request = objects_request(&image(), &ScanOptions::default());
         let data = request
             .objects_request
             .as_ref()
@@ -682,13 +720,80 @@ mod tests {
 
     #[test]
     fn the_request_round_trips_through_protobuf() {
-        let client = LensClient::new(None);
-        let request = client.objects_request(&image(), &ScanOptions::default().translate_to("de"));
+        let request = objects_request(&image(), &ScanOptions::default().translate_to("de"));
         let mut bytes = Vec::new();
         request.encode(&mut bytes).unwrap();
 
         let parsed = LensOverlayServerRequest::decode(&*bytes).unwrap();
         assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn request_body_encodes_the_same_request_the_builder_returns() {
+        let options = ScanOptions::default().translate_to("de");
+        let body = request_body(&image(), &options).unwrap();
+
+        // Not byte-compared against a second build: the uuid and timestamp
+        // differ per call by design. Decoding is what proves the body is the
+        // request rather than something re-encoded on the way out.
+        let parsed = LensOverlayServerRequest::decode(&*body).unwrap();
+        let filters = &context_of(&parsed).client_filters.as_ref().unwrap().filter;
+        assert_eq!(
+            filters[0].filter_type,
+            Some(LensOverlayFilterType::Translate as i32)
+        );
+    }
+
+    #[test]
+    fn the_headers_are_what_chromium_sends_and_nothing_about_transport() {
+        let headers = request_headers("test-key");
+        let names: Vec<&str> = headers.iter().map(|(name, _)| *name).collect();
+
+        assert_eq!(
+            names,
+            ["content-type", "accept", "user-agent", "x-goog-api-key"]
+        );
+        assert_eq!(headers[0].1, "application/x-protobuf");
+        assert_eq!(headers[3].1, "test-key");
+        // Content-Encoding and friends belong to whoever sends this; promising
+        // gzip here and not decompressing would surface as a protobuf error.
+        assert!(!names.iter().any(|n| n.contains("encoding")));
+        assert!(!names.iter().any(|n| n.contains("length")));
+    }
+
+    #[test]
+    fn a_client_carries_its_own_key_into_its_headers() {
+        let client = LensClient::new(Some("mine".to_owned()));
+        assert_eq!(client.api_key(), "mine");
+        assert!(
+            client
+                .headers()
+                .contains(&("x-goog-api-key", "mine".to_owned()))
+        );
+
+        let default = LensClient::new(None);
+        assert_eq!(default.api_key(), DEFAULT_API_KEY);
+    }
+
+    #[test]
+    fn parse_response_bytes_reads_what_the_endpoint_would_return() {
+        let mut encoded = Vec::new();
+        response_with(&["hello world"])
+            .encode(&mut encoded)
+            .unwrap();
+
+        let page = parse_response_bytes(&encoded, 800, 600).unwrap();
+        assert_eq!(page.full_text, "hello world");
+        assert_eq!((page.image_width, page.image_height), (800, 600));
+    }
+
+    #[test]
+    fn parse_response_bytes_says_it_is_not_protobuf_rather_than_guessing() {
+        // What a gzipped body looks like to the parser.
+        let message = parse_response_bytes(&[0x1F, 0x8B, 0x08, 0x00], 1, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("decoding"), "{message}");
     }
 
     fn response_with(paragraph_texts: &[&str]) -> LensOverlayServerResponse {
