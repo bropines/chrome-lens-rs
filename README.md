@@ -18,7 +18,11 @@ let page = client
     .scan_path("screenshot.png", &ScanOptions::default().translate_to("ru"))
     .await?;
 for paragraph in &page.paragraphs {
-    println!("{:?} -> {:?}", paragraph.text, paragraph.translation);
+    // Each line's share of the translation, where its source line was - which
+    // is where Chromium draws it too.
+    for line in &paragraph.lines {
+        println!("{:?} -> {:?} at {:?}", line.text, line.translation, line.geometry);
+    }
 }
 ```
 
@@ -58,6 +62,17 @@ let page = parse_response_bytes(&reply, image.width, image.height)?;
 
 `objects_request` gives you the `LensOverlayServerRequest` itself if you want to
 inspect or amend it before encoding.
+
+Turn the client off and you do not link a second HTTP stack:
+
+```toml
+chrome_lens_ocr = { version = "0.4", default-features = false }
+```
+
+That takes the dependency tree from **358 crates to 50** — no reqwest, hyper or
+tokio. The features are `client` (`LensClient`, on by default), `bin` (the two
+binaries, implies `client`) and `extra-formats` (webp, gif and bmp decoders on
+top of the mandatory jpeg and png).
 
 Two things the crate deliberately leaves to you: `request_headers` returns no
 transport headers, so `Accept-Encoding` and `Content-Length` are your client's

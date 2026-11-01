@@ -94,9 +94,26 @@ async fn main() -> ExitCode {
     if page.translation.is_some() {
         println!("\n--- translation ---");
         for (index, paragraph) in page.paragraphs.iter().enumerate() {
-            match &paragraph.translation {
-                Some(text) => println!("{text}"),
-                None => eprintln!("[paragraph {} came back untranslated]", index + 1),
+            let Some(translation) = &paragraph.translation else {
+                eprintln!("[paragraph {} came back untranslated]", index + 1);
+                continue;
+            };
+            println!("{}", translation.text);
+
+            // The per-line split is what an overlay actually draws, each piece
+            // over the source line it came from, so show it when it is there.
+            let per_line: Vec<&str> = paragraph
+                .lines
+                .iter()
+                .filter_map(|line| line.translation.as_deref())
+                .collect();
+            if per_line.len() > 1 {
+                for (line, text) in paragraph.lines.iter().zip(&per_line) {
+                    match &line.geometry {
+                        Some(g) => eprintln!("    [{:.3},{:.3}] {text}", g.center_x, g.center_y),
+                        None => eprintln!("    [no box] {text}"),
+                    }
+                }
             }
         }
     }

@@ -33,12 +33,15 @@ pub use crate::constants::{DEFAULT_API_KEY, LENS_CRUPLOAD_ENDPOINT};
 pub use crate::proto::CoordinateType;
 
 use std::f32::consts::PI;
-use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use prost::Message;
+
+#[cfg(feature = "client")]
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+#[cfg(feature = "client")]
+use std::{path::Path, time::Duration};
 
 use crate::constants::*;
 use crate::image_processor::{AlphaMode, ProcessedImage};
@@ -135,6 +138,27 @@ pub struct Line {
     pub text: String,
     pub words: Vec<Word>,
     pub geometry: Option<GeometryData>,
+    /// This line's share of the paragraph's translation, when there is one.
+    ///
+    /// Lens does not translate line by line: it returns one string per
+    /// paragraph plus a range per line saying which part of it belongs where.
+    /// This is that range already cut out, so an overlay can draw it at
+    /// [`Line::geometry`] - which is where the *source* line was, and where
+    /// Chromium puts the translation too, since the server sends no geometry
+    /// of its own for translated text.
+    pub translation: Option<String>,
+}
+
+/// A paragraph's translation.
+#[derive(Clone, Debug)]
+pub struct Translation {
+    /// The whole paragraph, translated. The per-line pieces are on
+    /// [`Line::translation`].
+    pub text: String,
+    /// The language Lens translated from, when it said - useful when it was
+    /// asked to detect.
+    pub source_language: Option<String>,
+    pub target_language: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -144,14 +168,12 @@ pub struct Paragraph {
     pub geometry: Option<GeometryData>,
     /// The language Lens detected for this paragraph, when it said.
     pub language: Option<String>,
-    /// This paragraph's translation, when one was asked for and returned.
+    /// This paragraph's translation, when one was asked for and succeeded.
     ///
-    /// Lens returns translations in a list parallel to the paragraphs, so this
-    /// is the entry at the same index. That correspondence is how the endpoint
-    /// behaves rather than something the protos promise, so treat a mismatch in
-    /// length as "no translation for this paragraph" - which is what happens
-    /// here - rather than as an error.
-    pub translation: Option<String>,
+    /// Lens pairs these with the paragraphs by position, so a paragraph it
+    /// could not translate leaves a `None` here rather than shifting the rest
+    /// along.
+    pub translation: Option<Translation>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,11 +195,18 @@ pub struct Page {
 /// Kept as an alias so code written against the previous name still compiles.
 pub type LensResult = Page;
 
+/// An HTTP client that sends the request for you.
+///
+/// Behind the default-on `client` feature. Without it the crate still builds
+/// requests and parses replies, which is what a caller with its own HTTP stack
+/// wants - and saves linking reqwest, hyper, tokio and a TLS stack beside it.
+#[cfg(feature = "client")]
 pub struct LensClient {
     client: reqwest::Client,
     api_key: String,
 }
 
+#[cfg(feature = "client")]
 impl LensClient {
     /// A client with the default API key, the one Chromium ships.
     #[must_use]
@@ -333,6 +362,7 @@ pub fn request_headers(api_key: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
+#[cfg(feature = "client")]
 impl LensClient {
     pub async fn scan_path<P: AsRef<Path>>(&self, path: P, options: &ScanOptions) -> Result<Page> {
         let image = image_processor::process_image_from_path(path, options.alpha_mode)?;
@@ -483,6 +513,7 @@ fn parse_line(line: &text_layout::Line, uploaded: Uploaded) -> Line {
             .geometry
             .as_ref()
             .and_then(|g| geometry_of(g, uploaded)),
+        translation: None,
     }
 }
 
@@ -517,30 +548,79 @@ fn non_empty(value: &str) -> Option<String> {
     }
 }
 
-/// Every translation Lens actually produced, in the order it listed them.
+/// The successful translation for each paragraph, by paragraph index.
 ///
-/// Anything other than SUCCESS is dropped: an unsupported language pair or a
+/// **A gleam's position in `deep_gleams` is the paragraph index**, so a gleam
+/// that did not succeed has to be skipped *in place*, leaving a `None`. This
+/// crate used to filter the failures out and then zip the survivors against
+/// the paragraphs, which put every translation after a mid-list failure on the
+/// wrong paragraph - silently, and only for images where something failed.
+/// chrome-lens-py's `_extract_translation_render_data` enumerates all of them
+/// for the same reason.
+///
+/// Anything other than SUCCESS is a `None`: an unsupported language pair or a
 /// same-language no-op carries an empty or echoed string that is worse than
-/// nothing for a caller rendering an overlay.
-fn successful_translations(objects: &LensOverlayObjectsResponse) -> Vec<String> {
+/// nothing in an overlay.
+fn translations_by_index(objects: &LensOverlayObjectsResponse) -> Vec<Option<&TranslationData>> {
     objects
         .deep_gleams
         .iter()
-        .filter_map(|gleam| match gleam.rendering_oneof.as_ref()? {
-            deep_gleam_data::RenderingOneof::Translation(data) => {
-                let code = data.status.as_ref()?.code?;
-                if code != translation_data::status::Code::Success as i32 {
-                    return None;
-                }
-                let text = data.translation.as_deref()?;
-                if text.is_empty() {
-                    None
-                } else {
-                    Some(text.to_owned())
-                }
+        .map(|gleam| {
+            let deep_gleam_data::RenderingOneof::Translation(data) =
+                gleam.rendering_oneof.as_ref()?;
+            if data.status.as_ref()?.code? != translation_data::status::Code::Success as i32 {
+                return None;
             }
+            if data.translation.as_deref().is_none_or(str::is_empty) {
+                return None;
+            }
+            Some(data)
         })
         .collect()
+}
+
+/// The `start..end` slice of a translation, in UTF-16 code units.
+///
+/// Lens states these ranges in UTF-16 code units, matching
+/// `icu::UnicodeString` - the proto's comment says "Unicode characters", which
+/// is not the same thing and would be wrong. Rust strings are UTF-8, so the
+/// range cannot index one directly: an emoji is one character, two UTF-16 code
+/// units and four bytes, and getting that wrong splits text mid-glyph.
+///
+/// `units` is the translation pre-encoded, so a paragraph of many lines does
+/// not re-encode per line.
+fn utf16_slice(units: &[u16], start: Option<i32>, end: Option<i32>) -> Option<String> {
+    // Unset means this line has no translation, which the proto states
+    // explicitly; a negative or reversed range is the server being odd and is
+    // better dropped than clamped into something that looks deliberate.
+    let start = usize::try_from(start?).ok()?;
+    let end = usize::try_from(end?).ok()?;
+    if start > end || end > units.len() {
+        return None;
+    }
+    let text = String::from_utf16_lossy(&units[start..end]);
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// Attach a paragraph's translation, and each line's share of it.
+fn attach_translation(paragraph: &mut Paragraph, data: &TranslationData) {
+    let Some(text) = data.translation.as_deref() else {
+        return;
+    };
+    let units: Vec<u16> = text.encode_utf16().collect();
+
+    // Lens sends one range per line of the *source* paragraph, in order, so
+    // they pair by position. A shorter list leaves the remaining lines without
+    // a translation rather than being an error.
+    for (line, range) in paragraph.lines.iter_mut().zip(data.line.iter()) {
+        line.translation = utf16_slice(&units, range.start, range.end);
+    }
+
+    paragraph.translation = Some(Translation {
+        text: text.to_owned(),
+        source_language: data.source_language.clone().filter(|s| !s.is_empty()),
+        target_language: data.target_language.clone().filter(|s| !s.is_empty()),
+    });
 }
 
 /// Decode a `crupload` response body and turn it into a [`Page`].
@@ -565,7 +645,14 @@ pub fn parse_response(
     image_width: i32,
     image_height: i32,
 ) -> Result<Page> {
-    if let Some(error) = &response.error {
+    // Only a non-zero error_type is a failure. The field has implicit
+    // presence, so a response can carry an `error` submessage that says
+    // UNKNOWN_TYPE(0) and still have a perfectly good objects_response beside
+    // it; chrome-lens-py's request_handler checks `error_type != 0` for the
+    // same reason.
+    if let Some(error) = &response.error
+        && error.error_type != 0
+    {
         let kind = lens_overlay_server_error::ErrorType::try_from(error.error_type)
             .map(|t| t.as_str_name().to_owned())
             .unwrap_or_else(|_| format!("error_type {}", error.error_type));
@@ -595,12 +682,16 @@ pub fn parse_response(
         })
         .unwrap_or_default();
 
-    // Lens lists translations in a list parallel to the paragraphs. Pair them
-    // up only as far as both go: a shorter list means some paragraphs have no
-    // translation, which is not an error.
-    let translations = successful_translations(objects);
-    for (paragraph, translation) in paragraphs.iter_mut().zip(translations.iter()) {
-        paragraph.translation = Some(translation.clone());
+    // By index, not by position among the successes - see
+    // `translations_by_index`. A gleam list longer than the paragraphs is the
+    // server translating something we did not parse; ignore the tail rather
+    // than failing.
+    for (paragraph, data) in paragraphs
+        .iter_mut()
+        .zip(translations_by_index(objects))
+        .filter_map(|(paragraph, data)| data.map(|data| (paragraph, data)))
+    {
+        attach_translation(paragraph, data);
     }
 
     let full_text = paragraphs
@@ -609,10 +700,15 @@ pub fn parse_response(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let translation = if translations.is_empty() {
+    let translated: Vec<&str> = paragraphs
+        .iter()
+        .filter_map(|p| p.translation.as_ref())
+        .map(|t| t.text.as_str())
+        .collect();
+    let translation = if translated.is_empty() {
         None
     } else {
-        Some(translations.join("\n"))
+        Some(translated.join("\n"))
     };
 
     Ok(Page {
@@ -906,6 +1002,37 @@ mod tests {
         }
     }
 
+    /// A successful translation carrying one range per source line.
+    fn translated_gleam(text: &str, ranges: &[(Option<i32>, Option<i32>)]) -> DeepGleamData {
+        DeepGleamData {
+            rendering_oneof: Some(deep_gleam_data::RenderingOneof::Translation(
+                TranslationData {
+                    status: Some(translation_data::Status {
+                        code: Some(translation_data::status::Code::Success as i32),
+                    }),
+                    translation: Some(text.to_owned()),
+                    line: ranges
+                        .iter()
+                        .map(|(start, end)| translation_data::Line {
+                            start: *start,
+                            end: *end,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn translation_of(page: &Page, index: usize) -> Option<&str> {
+        page.paragraphs[index]
+            .translation
+            .as_ref()
+            .map(|t| t.text.as_str())
+    }
+
     #[test]
     fn words_are_joined_by_their_separators_and_lines_by_newlines() {
         let page =
@@ -928,25 +1055,46 @@ mod tests {
         ];
 
         let page = parse_response(&response, 1, 1).unwrap();
-        assert_eq!(page.paragraphs[0].translation.as_deref(), Some("один"));
-        assert_eq!(page.paragraphs[1].translation.as_deref(), Some("два"));
+        assert_eq!(translation_of(&page, 0), Some("один"));
+        assert_eq!(translation_of(&page, 1), Some("два"));
         assert_eq!(page.translation.as_deref(), Some("один\nдва"));
     }
 
     #[test]
-    fn a_failed_translation_is_dropped_rather_than_shown() {
-        let mut response = response_with(&["one", "two"]);
+    fn a_failed_translation_leaves_a_hole_and_does_not_shift_the_rest() {
+        // The gleam's index IS the paragraph index. Filtering the failures out
+        // first and then zipping - which this crate used to do - moved "три"
+        // onto the second paragraph and left the third untranslated: silently,
+        // and only for images where something failed.
+        let mut response = response_with(&["one", "two", "three"]);
         let objects = response.objects_response.as_mut().unwrap();
         objects.deep_gleams = vec![
+            gleam("один", translation_data::status::Code::Success),
             gleam("", translation_data::status::Code::UnsupportedLanguagePair),
-            gleam("два", translation_data::status::Code::Success),
+            gleam("три", translation_data::status::Code::Success),
         ];
 
         let page = parse_response(&response, 1, 1).unwrap();
-        // The only surviving translation lands on the first paragraph, because
-        // the failed one left no entry at all.
-        assert_eq!(page.paragraphs[0].translation.as_deref(), Some("два"));
-        assert_eq!(page.translation.as_deref(), Some("два"));
+        assert_eq!(translation_of(&page, 0), Some("один"));
+        assert_eq!(
+            translation_of(&page, 1),
+            None,
+            "the failure must leave a hole"
+        );
+        assert_eq!(translation_of(&page, 2), Some("три"));
+        assert_eq!(page.translation.as_deref(), Some("один\nтри"));
+    }
+
+    #[test]
+    fn a_same_language_no_op_counts_as_a_failure() {
+        // It echoes the source back, which is worse than nothing in an overlay.
+        let mut response = response_with(&["one"]);
+        response.objects_response.as_mut().unwrap().deep_gleams =
+            vec![gleam("one", translation_data::status::Code::SameLanguage)];
+
+        let page = parse_response(&response, 1, 1).unwrap();
+        assert_eq!(translation_of(&page, 0), None);
+        assert!(page.translation.is_none());
     }
 
     #[test]
@@ -956,9 +1104,90 @@ mod tests {
             vec![gleam("один", translation_data::status::Code::Success)];
 
         let page = parse_response(&response, 1, 1).unwrap();
-        assert_eq!(page.paragraphs[0].translation.as_deref(), Some("один"));
+        assert_eq!(translation_of(&page, 0), Some("один"));
         assert!(page.paragraphs[1].translation.is_none());
         assert!(page.paragraphs[2].translation.is_none());
+    }
+
+    #[test]
+    fn each_line_gets_its_slice_of_the_paragraph_translation() {
+        let mut response = response_with(&["one two"]);
+        // A second source line, so there are two ranges into "привет мир".
+        let layout = response
+            .objects_response
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .text_layout
+            .as_mut()
+            .unwrap();
+        layout.paragraphs[0]
+            .lines
+            .push(text_layout::Line::default());
+
+        response.objects_response.as_mut().unwrap().deep_gleams = vec![translated_gleam(
+            "привет мир",
+            &[(Some(0), Some(6)), (Some(7), Some(10))],
+        )];
+
+        let page = parse_response(&response, 1, 1).unwrap();
+        assert_eq!(translation_of(&page, 0), Some("привет мир"));
+        assert_eq!(
+            page.paragraphs[0].lines[0].translation.as_deref(),
+            Some("привет")
+        );
+        assert_eq!(
+            page.paragraphs[0].lines[1].translation.as_deref(),
+            Some("мир")
+        );
+    }
+
+    #[test]
+    fn line_ranges_are_utf16_code_units_not_characters_or_bytes() {
+        // "ab" is two units; the emoji is one character, two UTF-16 units and
+        // four UTF-8 bytes. So 2..4 is the emoji under UTF-16, nothing under
+        // characters, and half of it under bytes.
+        let text = "ab\u{1F600}cd";
+        let units: Vec<u16> = text.encode_utf16().collect();
+
+        assert_eq!(
+            utf16_slice(&units, Some(2), Some(4)).as_deref(),
+            Some("\u{1F600}")
+        );
+        assert_eq!(utf16_slice(&units, Some(0), Some(2)).as_deref(), Some("ab"));
+        assert_eq!(utf16_slice(&units, Some(4), Some(6)).as_deref(), Some("cd"));
+    }
+
+    #[test]
+    fn an_absent_or_impossible_line_range_is_no_translation_rather_than_a_panic() {
+        let units: Vec<u16> = "hello".encode_utf16().collect();
+
+        assert!(utf16_slice(&units, None, Some(3)).is_none(), "unset start");
+        assert!(utf16_slice(&units, Some(0), None).is_none(), "unset end");
+        assert!(utf16_slice(&units, Some(3), Some(1)).is_none(), "reversed");
+        assert!(
+            utf16_slice(&units, Some(0), Some(99)).is_none(),
+            "past the end"
+        );
+        assert!(utf16_slice(&units, Some(-1), Some(3)).is_none(), "negative");
+        assert!(
+            utf16_slice(&units, Some(2), Some(2)).is_none(),
+            "empty slice"
+        );
+    }
+
+    #[test]
+    fn an_error_submessage_of_type_zero_is_not_an_error() {
+        // The field has implicit presence, so a good response can carry an
+        // `error` that says UNKNOWN_TYPE(0). chrome-lens-py checks
+        // `error_type != 0` for the same reason.
+        let mut response = response_with(&["hello world"]);
+        response.error = Some(LensOverlayServerError::default());
+
+        let page = parse_response(&response, 1, 1).expect("not an error");
+        assert_eq!(page.full_text, "hello world");
     }
 
     #[test]

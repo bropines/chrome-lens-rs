@@ -11,28 +11,38 @@ exclude = ["test.png", ".github/"]
 
 [dependencies]
 anyhow = "1.0"
-image = "0.25"
 log = "0.4"
 prost = "0.14"
+# Not only used by the client: objects_request needs it for the request uuid,
+# so it cannot move behind the `client` feature.
 rand = "0.9"
-reqwest = { version = "0.12", features = ["rustls-tls", "http2"] }
-tokio = { version = "1", features = ["rt", "macros"] }
 
-# Only the binaries need these: env_logger for the CLI, serde_json for the
-# GitHub API responses that update-protos reads.
-[dependencies.env_logger]
-version = "0.11"
-optional = true
+# jpeg because every upload is encoded as one, png because it is what a
+# screenshot usually arrives as. The rest of image's default set (tiff, gif,
+# exr, avif, ...) is left off so it does not unify into a consumer's build;
+# `extra-formats` adds the common ones back, and a consumer that depends on
+# image itself gets whatever it asks for anyway, since features unify.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
-[dependencies.serde_json]
-version = "1.0"
-optional = true
+reqwest = { version = "0.12", features = ["rustls-tls", "http2"], optional = true }
+tokio = { version = "1", features = ["rt", "macros"], optional = true }
+env_logger = { version = "0.11", optional = true }
+serde_json = { version = "1.0", optional = true }
 
 [features]
-default = ["bin"]
-# The `chrome_lens_ocr` CLI and the `update-protos` tool. A library consumer
-# can switch this off (`default-features = false`) and skip their dependencies.
-bin = ["dep:env_logger", "dep:serde_json", "tokio/full"]
+default = ["client", "bin", "extra-formats"]
+
+# `LensClient`, which owns an HTTP client and sends the request itself. Off,
+# the crate still builds the request, the headers and parses the reply - which
+# is all a caller with its own HTTP stack wants, and avoids linking a second
+# one (reqwest pulls hyper, tokio and the TLS stack with it).
+client = ["dep:reqwest", "dep:tokio"]
+
+# The `chrome_lens_ocr` CLI and the `update-protos` tool.
+bin = ["client", "dep:env_logger", "dep:serde_json", "tokio/full"]
+
+# Decoders beyond jpeg and png, for input images.
+extra-formats = ["image/webp", "image/gif", "image/bmp"]
 
 [[bin]]
 name = "chrome_lens_ocr"

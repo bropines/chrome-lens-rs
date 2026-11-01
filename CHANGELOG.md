@@ -17,8 +17,18 @@ sends and reads. Everything below is measured against
 - `process_image_path`/`process_image_bytes` still take an OCR language and do
   OCR only. Translation needs the new `scan_path`/`scan_bytes` with
   `ScanOptions`.
-- The binaries are behind a default-on `bin` feature, so a library consumer can
-  turn off `env_logger` and `serde_json` with `default-features = false`.
+- `Paragraph::translation` is a `Translation` rather than a `String`; the
+  string is on its `text`.
+- **`LensClient` is behind a default-on `client` feature**, along with
+  `reqwest` and `tokio`. A consumer that sends through its own HTTP stack no
+  longer links a second one: `default-features = false` takes the dependency
+  tree from **358 crates to 50**, with no reqwest, hyper or tokio in it. The
+  binaries are behind `bin`, which implies `client`.
+- `image` is taken with `default-features = false` and only `jpeg` (every
+  upload is encoded as one) and `png`. The default-on `extra-formats` adds
+  `webp`, `gif` and `bmp`; the rest of image's default set (tiff, exr, avif,
+  ...) no longer unifies into a consumer's build. `rand` stays mandatory -
+  it is used for the request uuid, not only by the client.
 - `bytes`, `url` and `thiserror` are no longer dependencies; none of them was
   used.
 
@@ -28,10 +38,19 @@ sends and reads. Everything below is measured against
   but never asked for a translation, so that field could only ever be `None`.
   Lens fills it in only when the request carries a `TRANSLATE` filter, which is
   now sent when `ScanOptions::target_language` is set.
-- Per-paragraph translations on `Paragraph::translation`, paired with the
-  paragraphs by index. A translation whose status is anything but `SUCCESS` is
-  dropped rather than shown: an unsupported language pair or a same-language
-  no-op carries an empty or echoed string that is worse than nothing.
+- Per-paragraph translations on `Paragraph::translation`, as a `Translation`
+  with the text and the languages, paired with the paragraphs by index. A
+  translation whose status is anything but `SUCCESS` is dropped rather than
+  shown: an unsupported language pair or a same-language no-op carries an empty
+  or echoed string that is worse than nothing.
+- **Per-line translations on `Line::translation`.** Lens does not translate
+  line by line - it returns one string per paragraph plus a range per line -
+  so this is that range cut out, ready to draw at `Line::geometry`, which is
+  where the source line was and where Chromium puts the translation too. The
+  ranges are UTF-16 code units (matching `icu::UnicodeString`, not the
+  "Unicode characters" the proto comment claims), so they are sliced as such:
+  an emoji is one character, two UTF-16 code units and four UTF-8 bytes, and
+  guessing wrong splits text mid-glyph.
 - `ScanOptions` for the OCR language, translation target and source, client
   region and time zone, and the alpha mode.
 - **The request can be built without being sent**, for callers that already
@@ -45,6 +64,17 @@ sends and reads. Everything below is measured against
 - 25 tests, over request construction, the response parse and the image rules.
 
 ### Fixed
+
+- **A failed translation no longer shifts every later one onto the wrong
+  paragraph.** A gleam's position in `deep_gleams` *is* the paragraph index, so
+  a gleam that did not succeed has to be skipped in place. This crate filtered
+  the failures out and then zipped the survivors against the paragraphs, so one
+  failure in the middle moved every translation after it up by one — silently,
+  and only for images where something failed. Found by the Glossa team.
+- A response carrying an `error` submessage of type `UNKNOWN_TYPE` (0) is no
+  longer treated as a failure. The field has implicit presence, so a perfectly
+  good response can have one; chrome-lens-py checks `error_type != 0` for the
+  same reason.
 
 - **A `coordinate_type: IMAGE` box is no longer read as a fraction.** The
   server may send a box either normalised or in pixels of the uploaded image,
