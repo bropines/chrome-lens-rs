@@ -29,6 +29,8 @@ pub mod image_processor;
 pub mod proto;
 
 pub use crate::constants::{DEFAULT_API_KEY, LENS_CRUPLOAD_ENDPOINT};
+// Exposed on GeometryData, so it should not need a `proto::` path.
+pub use crate::proto::CoordinateType;
 
 use std::f32::consts::PI;
 use std::path::Path;
@@ -91,10 +93,18 @@ impl ScanOptions {
 
 /// A box around recognised text.
 ///
-/// The coordinates are normalised to the image: `center_x`/`width` are
-/// fractions of its width, `center_y`/`height` of its height. Multiply by the
-/// dimensions of the image **as uploaded** ([`ProcessedImage::width`]) to get
-/// pixels - which equal the original's only when no downscale happened.
+/// The coordinates are always normalised: `center_x`/`width` are fractions of
+/// the image's width, `center_y`/`height` of its height.
+///
+/// So multiply by whichever copy you are drawing on - the original or the
+/// uploaded one. A downscale preserves the aspect ratio, and a fraction is
+/// invariant under that, so both give the right answer. (The uploaded size is
+/// on [`Page::image_width`]/[`Page::image_height`] if you need it.)
+///
+/// That holds even though the server may send either kind of box: a
+/// `CoordinateType::Image` box arrives in pixels of the *uploaded* copy, and
+/// this crate divides it back down so callers have one rule rather than two.
+/// [`GeometryData::coordinate_type`] still says which kind it was.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GeometryData {
     pub center_x: f32,
@@ -105,6 +115,10 @@ pub struct GeometryData {
     pub rotation_z: f32,
     /// The same rotation in degrees, for renderers that want it that way.
     pub angle_deg: f32,
+    /// What the server said these coordinates were, before this crate
+    /// normalised them. Informational: the four fields above are normalised
+    /// either way.
+    pub coordinate_type: CoordinateType,
 }
 
 #[derive(Clone, Debug)]
@@ -405,29 +419,58 @@ fn now_usec() -> u64 {
         .unwrap_or(0)
 }
 
-fn geometry_of(geometry: &Geometry) -> Option<GeometryData> {
+/// The dimensions a response's boxes are read against: the image as uploaded.
+#[derive(Clone, Copy, Debug)]
+struct Uploaded {
+    width: f32,
+    height: f32,
+}
+
+fn geometry_of(geometry: &Geometry, uploaded: Uploaded) -> Option<GeometryData> {
     let box_ = geometry.bounding_box.as_ref()?;
     let rotation_z = box_.rotation_z.unwrap_or(0.0);
+    let coordinate_type = box_
+        .coordinate_type
+        .and_then(|value| CoordinateType::try_from(value).ok())
+        .unwrap_or(CoordinateType::Unspecified);
+
+    // A box can arrive either way. IMAGE means pixels of the image *as
+    // uploaded*, so it is divided back down here and everything this crate
+    // hands out is normalised - which is what makes the one scaling rule in
+    // `GeometryData`'s docs true for every box. NORMALIZED and UNSPECIFIED are
+    // both already fractions; the endpoint leaves the type unset for most of
+    // what it returns.
+    let (sx, sy) = match coordinate_type {
+        CoordinateType::Image if uploaded.width > 0.0 && uploaded.height > 0.0 => {
+            (1.0 / uploaded.width, 1.0 / uploaded.height)
+        }
+        _ => (1.0, 1.0),
+    };
+
     Some(GeometryData {
-        center_x: box_.center_x.unwrap_or(0.0),
-        center_y: box_.center_y.unwrap_or(0.0),
-        width: box_.width.unwrap_or(0.0),
-        height: box_.height.unwrap_or(0.0),
+        center_x: box_.center_x.unwrap_or(0.0) * sx,
+        center_y: box_.center_y.unwrap_or(0.0) * sy,
+        width: box_.width.unwrap_or(0.0) * sx,
+        height: box_.height.unwrap_or(0.0) * sy,
         rotation_z,
         angle_deg: rotation_z * (180.0 / PI),
+        coordinate_type,
     })
 }
 
-fn parse_word(word: &text_layout::Word) -> Word {
+fn parse_word(word: &text_layout::Word, uploaded: Uploaded) -> Word {
     Word {
         text: word.plain_text.clone(),
         separator: word.text_separator.clone(),
-        geometry: word.geometry.as_ref().and_then(geometry_of),
+        geometry: word
+            .geometry
+            .as_ref()
+            .and_then(|g| geometry_of(g, uploaded)),
     }
 }
 
-fn parse_line(line: &text_layout::Line) -> Line {
-    let words: Vec<Word> = line.words.iter().map(parse_word).collect();
+fn parse_line(line: &text_layout::Line, uploaded: Uploaded) -> Line {
+    let words: Vec<Word> = line.words.iter().map(|w| parse_word(w, uploaded)).collect();
     let mut text = String::new();
     for word in &words {
         text.push_str(&word.text);
@@ -436,12 +479,19 @@ fn parse_line(line: &text_layout::Line) -> Line {
     Line {
         text: text.trim_end().to_owned(),
         words,
-        geometry: line.geometry.as_ref().and_then(geometry_of),
+        geometry: line
+            .geometry
+            .as_ref()
+            .and_then(|g| geometry_of(g, uploaded)),
     }
 }
 
-fn parse_paragraph(paragraph: &text_layout::Paragraph) -> Paragraph {
-    let lines: Vec<Line> = paragraph.lines.iter().map(parse_line).collect();
+fn parse_paragraph(paragraph: &text_layout::Paragraph, uploaded: Uploaded) -> Paragraph {
+    let lines: Vec<Line> = paragraph
+        .lines
+        .iter()
+        .map(|l| parse_line(l, uploaded))
+        .collect();
     let text = lines
         .iter()
         .map(|line| line.text.as_str())
@@ -450,7 +500,10 @@ fn parse_paragraph(paragraph: &text_layout::Paragraph) -> Paragraph {
     Paragraph {
         text,
         lines,
-        geometry: paragraph.geometry.as_ref().and_then(geometry_of),
+        geometry: paragraph
+            .geometry
+            .as_ref()
+            .and_then(|g| geometry_of(g, uploaded)),
         language: non_empty(&paragraph.content_language),
         translation: None,
     }
@@ -524,11 +577,22 @@ pub fn parse_response(
         .as_ref()
         .ok_or_else(|| anyhow!("Lens returned neither an objects response nor an error"))?;
 
+    let uploaded = Uploaded {
+        width: image_width as f32,
+        height: image_height as f32,
+    };
+
     let mut paragraphs: Vec<Paragraph> = objects
         .text
         .as_ref()
         .and_then(|text| text.text_layout.as_ref())
-        .map(|layout| layout.paragraphs.iter().map(parse_paragraph).collect())
+        .map(|layout| {
+            layout
+                .paragraphs
+                .iter()
+                .map(|p| parse_paragraph(p, uploaded))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Lens lists translations in a list parallel to the paragraphs. Pair them
@@ -953,5 +1017,59 @@ mod tests {
         assert!((geometry.angle_deg - 90.0).abs() < 0.001);
         // Normalised, so pixels are the caller's multiplication to do.
         assert_eq!(geometry.center_x * page.image_width as f32, 500.0);
+    }
+
+    #[test]
+    fn a_pixel_typed_box_is_divided_back_down_to_a_fraction() {
+        // coordinate_type IMAGE means pixels of the image as uploaded. Left
+        // alone, a caller applying the one documented rule would multiply
+        // pixels by a size and land far off the picture.
+        let mut response = response_with(&["x"]);
+        let objects = response.objects_response.as_mut().unwrap();
+        let layout = objects.text.as_mut().unwrap().text_layout.as_mut().unwrap();
+        layout.paragraphs[0].geometry = Some(Geometry {
+            bounding_box: Some(CenterRotatedBox {
+                center_x: Some(800.0),
+                center_y: Some(300.0),
+                width: Some(400.0),
+                height: Some(100.0),
+                rotation_z: Some(0.0),
+                coordinate_type: Some(CoordinateType::Image as i32),
+            }),
+            ..Default::default()
+        });
+
+        // Uploaded at 1600x600, so 800px across is half the width.
+        let page = parse_response(&response, 1600, 600).unwrap();
+        let geometry = page.paragraphs[0].geometry.unwrap();
+        assert_eq!(geometry.center_x, 0.5);
+        assert_eq!(geometry.center_y, 0.5);
+        assert_eq!(geometry.width, 0.25);
+        assert_eq!(geometry.coordinate_type, CoordinateType::Image);
+
+        // And the one rule now works against the original, 3200x1200.
+        assert_eq!(geometry.center_x * 3200.0, 1600.0);
+    }
+
+    #[test]
+    fn a_box_with_no_stated_type_is_taken_as_already_normalised() {
+        let mut response = response_with(&["x"]);
+        let objects = response.objects_response.as_mut().unwrap();
+        let layout = objects.text.as_mut().unwrap().text_layout.as_mut().unwrap();
+        layout.paragraphs[0].geometry = Some(Geometry {
+            bounding_box: Some(CenterRotatedBox {
+                center_x: Some(0.5),
+                width: Some(0.25),
+                coordinate_type: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let page = parse_response(&response, 1600, 600).unwrap();
+        let geometry = page.paragraphs[0].geometry.unwrap();
+        assert_eq!(geometry.center_x, 0.5);
+        assert_eq!(geometry.width, 0.25);
+        assert_eq!(geometry.coordinate_type, CoordinateType::Unspecified);
     }
 }

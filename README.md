@@ -22,8 +22,12 @@ for paragraph in &page.paragraphs {
 }
 ```
 
-Each paragraph, line and word carries a `GeometryData` box, normalised to the
-uploaded image, so you can place text back over the picture.
+Each paragraph, line and word carries a `GeometryData` box so you can place
+text back over the picture. The coordinates are always fractions of the image,
+so multiply by whichever copy you are drawing on — a downscale preserves the
+aspect ratio, and a fraction is invariant under that. (The server may send a
+box in pixels instead; those are divided back down on the way out, so callers
+have one rule rather than two.)
 
 There is a CLI for looking at a response:
 

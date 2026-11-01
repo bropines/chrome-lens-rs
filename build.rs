@@ -44,8 +44,9 @@
 //! simply ignores it and decides presence from the file's `syntax` alone, so
 //! the override is lost whatever we put in the descriptor. The source text is
 //! the cheapest place to notice one, and we vendor it - so
-//! `warn_about_per_field_overrides` scans for them and names any that is not
-//! already known and accepted.
+//! `check_per_field_overrides` scans for them and fails the build unless the
+//! set is exactly the one listed, with reasons, in
+//! `ACCEPTED_PER_FIELD_OVERRIDES`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -84,34 +85,53 @@ const ACCEPTED_PER_FIELD_OVERRIDES: &[&str] = &[
     "lens_overlay_text.proto:text_separator",
 ];
 
-/// Name any per-field presence override that is not already accounted for.
+/// Every per-field presence override in the vendored sources, as `file:field`.
+fn per_field_overrides(name: &str, source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter(|line| line.contains("[features.field_presence"))
+        .map(|line| {
+            // `string crop_id = 1 [features.field_presence = IMPLICIT];`
+            let field = line
+                .split('=')
+                .next()
+                .unwrap_or(line)
+                .split_whitespace()
+                .last()
+                .unwrap_or("?");
+            format!("{name}:{field}")
+        })
+        .collect()
+}
+
+/// Fail unless the overrides in the sources are exactly the accepted ones.
 ///
-/// These are invisible downstream - see the module docs - so the source scan is
-/// the only warning anyone gets. A warning rather than a hard failure: an
-/// override on a field this crate never touches should not stop a build.
-fn warn_about_per_field_overrides(name: &str, source: &str) {
-    for line in source.lines() {
-        if !line.contains("[features.field_presence") {
-            continue;
-        }
-        // `string crop_id = 1 [features.field_presence = IMPLICIT];`
-        let field = line
-            .split('=')
-            .next()
-            .unwrap_or(line)
-            .split_whitespace()
-            .last()
-            .unwrap_or("?");
-        let key = format!("{name}:{field}");
-        if ACCEPTED_PER_FIELD_OVERRIDES.contains(&key.as_str()) {
-            continue;
-        }
-        println!(
-            "cargo::warning={key} overrides field presence for itself, which a \
-             descriptor set cannot carry; it is generated with its file's \
-             presence instead. Check whether this crate writes that field."
-        );
-    }
+/// A failure rather than a warning, and in both directions: an override prost
+/// silently drops is worth a human deciding about, and one that *disappears*
+/// means the accepted list - and the reasoning attached to it - is now stale.
+/// A warning on a 45-file re-pin is a warning nobody reads.
+fn check_per_field_overrides(found: &mut [String]) {
+    found.sort();
+    let mut accepted: Vec<&str> = ACCEPTED_PER_FIELD_OVERRIDES.to_vec();
+    accepted.sort_unstable();
+
+    let added: Vec<&String> = found
+        .iter()
+        .filter(|key| !accepted.contains(&key.as_str()))
+        .collect();
+    let gone: Vec<&&str> = accepted
+        .iter()
+        .filter(|key| !found.iter().any(|f| f == *key))
+        .collect();
+
+    assert!(
+        added.is_empty() && gone.is_empty(),
+        "the per-field presence overrides in {PROTO_DIR} have moved.\n\
+         \n  new, and prost will silently drop each one: {added:?}\
+         \n  gone, so its entry in ACCEPTED_PER_FIELD_OVERRIDES is stale: {gone:?}\n\
+         \nDecide what each new one means for the fields this crate reads or \
+         writes, then list it in ACCEPTED_PER_FIELD_OVERRIDES with the reason."
+    );
 }
 
 fn main() {
@@ -142,6 +162,7 @@ fn main() {
         commit.trim().get(..12).unwrap_or("?")
     );
 
+    let mut overrides = Vec::new();
     for path in &protos {
         let name = path
             .file_name()
@@ -149,8 +170,9 @@ fn main() {
             .expect("a proto file name");
         let source =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {name}: {e}"));
-        warn_about_per_field_overrides(name, &source);
+        overrides.extend(per_field_overrides(name, &source));
     }
+    check_per_field_overrides(&mut overrides);
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let fds_path = out_dir.join("lens_protos.fds");

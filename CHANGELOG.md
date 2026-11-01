@@ -44,6 +44,16 @@ sends and reads. Everything below is measured against
 - `cargo run --bin update-protos` re-pins the vendored protos to a Chromium ref.
 - 25 tests, over request construction, the response parse and the image rules.
 
+### Fixed
+
+- **A `coordinate_type: IMAGE` box is no longer read as a fraction.** The
+  server may send a box either normalised or in pixels of the uploaded image,
+  and the crate ignored the field and treated every box as normalised. A pixel
+  box then came out three orders of magnitude too large. They are divided back
+  down now, so every `GeometryData` is normalised and the one scaling rule in
+  its docs holds for all of them; `GeometryData::coordinate_type` still reports
+  what the server sent. Found by the Glossa team hitting the same hole.
+
 ### Changed
 
 - **The protos are generated from Chromium's `.proto` files** rather than
