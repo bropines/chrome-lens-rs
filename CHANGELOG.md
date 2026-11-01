@@ -44,13 +44,25 @@ sends and reads. Everything below is measured against
   shown: an unsupported language pair or a same-language no-op carries an empty
   or echoed string that is worse than nothing.
 - **Per-line translations on `Line::translation`.** Lens does not translate
-  line by line - it returns one string per paragraph plus a range per line -
-  so this is that range cut out, ready to draw at `Line::geometry`, which is
-  where the source line was and where Chromium puts the translation too. The
-  ranges are UTF-16 code units (matching `icu::UnicodeString`, not the
-  "Unicode characters" the proto comment claims), so they are sliced as such:
-  an emoji is one character, two UTF-16 code units and four UTF-8 bytes, and
-  guessing wrong splits text mid-glyph.
+  line by line - it returns one string per paragraph plus ranges saying which
+  part belongs where - so this is that text assembled, ready to draw at
+  `Line::geometry`, which is where the source line was and where Chromium puts
+  the translation too.
+
+  It is built from the *word* ranges, the way Chromium's
+  `CreateTranslatedLineMojomFromProto` and chrome-lens-py's `build_line_text`
+  do, rather than by slicing the line's own `start..end`: each word plus the
+  gap up to the next, and for the last word the gap up to the first word of
+  the following line. That keeps the lines concatenating back into
+  `Translation::text`, and keeps any padding in the line range out of the
+  drawn text. A line can therefore end in a space - deliberate, and what makes
+  the concatenation work; trim before measuring or centring. A line carrying
+  no word ranges falls back to its own range.
+
+  The ranges are UTF-16 code units, matching `icu::UnicodeString` and *not*
+  the "Unicode characters" the proto comment claims, so they are sliced as
+  such: an emoji is one character, two UTF-16 code units and four UTF-8 bytes,
+  and guessing wrong splits text mid-glyph.
 - `ScanOptions` for the OCR language, translation target and source, client
   region and time zone, and the alpha mode.
 - **The request can be built without being sent**, for callers that already

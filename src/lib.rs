@@ -141,11 +141,17 @@ pub struct Line {
     /// This line's share of the paragraph's translation, when there is one.
     ///
     /// Lens does not translate line by line: it returns one string per
-    /// paragraph plus a range per line saying which part of it belongs where.
-    /// This is that range already cut out, so an overlay can draw it at
+    /// paragraph plus ranges saying which part of it belongs where. This is
+    /// that text already assembled, so an overlay can draw it at
     /// [`Line::geometry`] - which is where the *source* line was, and where
     /// Chromium puts the translation too, since the server sends no geometry
     /// of its own for translated text.
+    ///
+    /// It is built from the word ranges the way Chromium's
+    /// `CreateTranslatedLineMojomFromProto` does, which means the separator
+    /// after the last word is included and a line can therefore **end in a
+    /// space**. That is deliberate: it is what makes the lines concatenate
+    /// back into [`Translation::text`]. Trim it before measuring or centring.
     pub translation: Option<String>,
 }
 
@@ -589,6 +595,8 @@ fn translations_by_index(objects: &LensOverlayObjectsResponse) -> Vec<Option<&Tr
 ///
 /// `units` is the translation pre-encoded, so a paragraph of many lines does
 /// not re-encode per line.
+/// An empty slice is a legitimate answer, so `None` means only that the range
+/// was unset or impossible.
 fn utf16_slice(units: &[u16], start: Option<i32>, end: Option<i32>) -> Option<String> {
     // Unset means this line has no translation, which the proto states
     // explicitly; a negative or reversed range is the server being odd and is
@@ -598,8 +606,57 @@ fn utf16_slice(units: &[u16], start: Option<i32>, end: Option<i32>) -> Option<St
     if start > end || end > units.len() {
         return None;
     }
-    let text = String::from_utf16_lossy(&units[start..end]);
-    if text.is_empty() { None } else { Some(text) }
+    Some(String::from_utf16_lossy(&units[start..end]))
+}
+
+/// One line of a translation, assembled the way Chromium assembles it.
+///
+/// Not the line's own `start..end` range, which is what you would reach for
+/// first: Chromium's `CreateTranslatedLineMojomFromProto` builds the line from
+/// the *word* ranges, taking each word plus the gap up to the next one - and
+/// for the last word, the gap up to the first word of the following line.
+/// chrome-lens-py's `build_line_text` mirrors it. Doing that rather than
+/// slicing the line range keeps the pieces concatenating back into the
+/// paragraph, and keeps whatever padding the server put in the line range out
+/// of the drawn text.
+///
+/// The trailing gap is kept, so a line can end in a space. That is Chromium's
+/// behaviour and it is what makes the concatenation work; trim it if you are
+/// measuring or centring the text.
+///
+/// Falls back to the line's own range when a line carries no word ranges.
+fn line_translation(
+    units: &[u16],
+    line: &translation_data::Line,
+    next: Option<&translation_data::Line>,
+) -> Option<String> {
+    if line.word.is_empty() {
+        return utf16_slice(units, line.start, line.end).filter(|text| !text.trim().is_empty());
+    }
+
+    let mut text = String::new();
+    for (index, word) in line.word.iter().enumerate() {
+        if let Some(part) = utf16_slice(units, word.start, word.end) {
+            text.push_str(&part);
+        }
+        let gap_end = match line.word.get(index + 1) {
+            Some(following) => following.start,
+            // The separator after the last word lives between this line and
+            // the next, so it is read across the boundary.
+            None => next
+                .and_then(|line| line.word.first())
+                .and_then(|w| w.start),
+        };
+        if let Some(part) = utf16_slice(units, word.end, gap_end) {
+            text.push_str(&part);
+        }
+    }
+
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// Attach a paragraph's translation, and each line's share of it.
@@ -609,11 +666,11 @@ fn attach_translation(paragraph: &mut Paragraph, data: &TranslationData) {
     };
     let units: Vec<u16> = text.encode_utf16().collect();
 
-    // Lens sends one range per line of the *source* paragraph, in order, so
+    // Lens sends one entry per line of the *source* paragraph, in order, so
     // they pair by position. A shorter list leaves the remaining lines without
     // a translation rather than being an error.
-    for (line, range) in paragraph.lines.iter_mut().zip(data.line.iter()) {
-        line.translation = utf16_slice(&units, range.start, range.end);
+    for (index, (line, ranges)) in paragraph.lines.iter_mut().zip(data.line.iter()).enumerate() {
+        line.translation = line_translation(&units, ranges, data.line.get(index + 1));
     }
 
     paragraph.translation = Some(Translation {
@@ -1145,6 +1202,87 @@ mod tests {
     }
 
     #[test]
+    fn a_line_is_assembled_from_word_ranges_with_the_gap_after_each_word() {
+        // "привет мир" as two words on one line. Chromium takes each word plus
+        // the gap up to the next, so the space between them comes along.
+        let units: Vec<u16> = "привет мир".encode_utf16().collect();
+        let line = translation_data::Line {
+            word: vec![
+                translation_data::line::Word {
+                    start: Some(0),
+                    end: Some(6),
+                },
+                translation_data::line::Word {
+                    start: Some(7),
+                    end: Some(10),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            line_translation(&units, &line, None).as_deref(),
+            Some("привет мир")
+        );
+    }
+
+    #[test]
+    fn the_separator_after_the_last_word_is_read_from_the_next_line() {
+        // Chromium's CreateTranslatedLineMojomFromProto crosses the boundary
+        // for the last word, which is why a line can end in a space - and why
+        // the lines concatenate back into the paragraph.
+        let units: Vec<u16> = "привет мир".encode_utf16().collect();
+        let first = translation_data::Line {
+            word: vec![translation_data::line::Word {
+                start: Some(0),
+                end: Some(6),
+            }],
+            ..Default::default()
+        };
+        let second = translation_data::Line {
+            word: vec![translation_data::line::Word {
+                start: Some(7),
+                end: Some(10),
+            }],
+            ..Default::default()
+        };
+
+        let one = line_translation(&units, &first, Some(&second)).unwrap();
+        let two = line_translation(&units, &second, None).unwrap();
+
+        assert_eq!(one, "привет ", "the trailing space is deliberate");
+        assert_eq!(two, "мир");
+        assert_eq!(one + &two, "привет мир", "the lines must concatenate back");
+    }
+
+    #[test]
+    fn a_line_with_no_word_ranges_falls_back_to_its_own_range() {
+        let units: Vec<u16> = "привет мир".encode_utf16().collect();
+        let line = translation_data::Line {
+            start: Some(0),
+            end: Some(6),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            line_translation(&units, &line, None).as_deref(),
+            Some("привет")
+        );
+    }
+
+    #[test]
+    fn a_line_whose_assembly_is_only_whitespace_has_no_translation() {
+        let units: Vec<u16> = "a  b".encode_utf16().collect();
+        let line = translation_data::Line {
+            start: Some(1),
+            end: Some(3),
+            ..Default::default()
+        };
+
+        assert!(line_translation(&units, &line, None).is_none());
+    }
+
+    #[test]
     fn line_ranges_are_utf16_code_units_not_characters_or_bytes() {
         // "ab" is two units; the emoji is one character, two UTF-16 units and
         // four UTF-8 bytes. So 2..4 is the emoji under UTF-16, nothing under
@@ -1172,10 +1310,9 @@ mod tests {
             "past the end"
         );
         assert!(utf16_slice(&units, Some(-1), Some(3)).is_none(), "negative");
-        assert!(
-            utf16_slice(&units, Some(2), Some(2)).is_none(),
-            "empty slice"
-        );
+        // An empty range is a legitimate answer, not a missing one: it is what
+        // a zero-width gap between two adjacent words looks like.
+        assert_eq!(utf16_slice(&units, Some(2), Some(2)).as_deref(), Some(""));
     }
 
     #[test]
