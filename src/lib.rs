@@ -151,7 +151,13 @@ pub struct Line {
     /// `CreateTranslatedLineMojomFromProto` does, which means the separator
     /// after the last word is included and a line can therefore **end in a
     /// space**. That is deliberate: it is what makes the lines concatenate
-    /// back into [`Translation::text`]. Trim it before measuring or centring.
+    /// back into [`Translation::text`].
+    ///
+    /// Trim it if you are drawing each line on its own - measuring it,
+    /// centring it, or fitting a font to the line's box, where a trailing
+    /// separator only shrinks the text. Keep it if you might reassemble the
+    /// paragraph. The untrimmed form is what this returns because trimming
+    /// cannot be undone.
     pub translation: Option<String>,
 }
 
