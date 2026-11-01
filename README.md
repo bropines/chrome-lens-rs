@@ -1,73 +1,140 @@
-# Chrome Lens OCR
+# chrome-lens-rs
 
-[![Crates.io](https://img.shields.io/crates/v/chrome_lens_ocr.svg)](https://crates.io/crates/chrome_lens_ocr)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Maintenance](https://img.shields.io/badge/maintenance-active-green.svg)
+Google Lens OCR and translation from Rust, through the same `crupload` endpoint
+Chromium's lens overlay uses. No Google account, no API key of your own, no
+headless browser.
 
-**A lightweight, high-performance Rust library to use Google Lens OCR.**
+```rust
+use chrome_lens_ocr::{LensClient, ScanOptions};
 
-This crate allows you to extract text from images using the Google Lens API used in Chromium. It functions without a headless browser, making it significantly faster and lighter than Puppeteer-based solutions.
+let client = LensClient::new(None);
 
-## ✨ Features
+// OCR.
+let page = client.scan_path("screenshot.png", &ScanOptions::default()).await?;
+println!("{}", page.full_text);
 
-* **Zero Headless Browser:** No need for Selenium, Puppeteer, or Playwright.
-* **No Authentication:** Works without a Google account or API keys.
-* **High Performance:** Direct API calls make it fast and efficient.
-* **Rust Port:** A direct port of the Python library [chrome-lens-py](https://github.com/bropines/chrome-lens-py).
-
----
-
-## 📦 Installation
-
-### As a Library
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-chrome_lens_ocr = "0.1.0"
-
-Or run the following command:
-
-```bash
-cargo add chrome_lens_ocr
+// OCR plus translation into Russian.
+let page = client
+    .scan_path("screenshot.png", &ScanOptions::default().translate_to("ru"))
+    .await?;
+for paragraph in &page.paragraphs {
+    println!("{:?} -> {:?}", paragraph.text, paragraph.translation);
+}
 ```
 
-### As a CLI Tool
+Each paragraph, line and word carries a `GeometryData` box, normalised to the
+uploaded image, so you can place text back over the picture.
 
-To install the binary globally:
+There is a CLI for looking at a response:
 
-```bash
-cargo install chrome_lens_ocr
+```
+cargo run -- image.png --to ru
 ```
 
------
+## Where this came from
 
-### Using the CLI
+A fork of [KolbyML/chrome-lens-ocr](https://github.com/KolbyML/chrome-lens-ocr),
+which is itself a Rust reimplementation of a subset of
+[chrome-lens-py](https://github.com/bropines/chrome-lens-py). This fork brings
+it up to what chrome-lens-py 4.0.0 actually sends and reads.
 
-If you have installed the crate globally or are running it from the source:
+### The protos are generated, not transcribed
 
-```bash
-# From source
-cargo run -- test.png
+The fork's `src/proto.rs` was about two hundred lines of prost structs with
+field numbers typed in by hand. Those are now generated at build time from
+Chromium's own `.proto` files, vendored under `third_party/lens_server_proto`
+and pinned to one commit in `CHROMIUM_COMMIT` beside them.
 
-# If installed globally
-chrome_lens_ocr test.png
+Re-pin them with:
+
+```
+cargo run --bin update-protos -- --ref main
 ```
 
------
+which resolves the ref to a commit, downloads the directory, checks that every
+import of every file resolves, drops files upstream has removed, and exits
+non-zero on any problem. `aim_communication.proto` is excluded, with the reason
+printed on every run: it imports protos from `third_party/omnibox_proto` and
+`components/optimization_guide` that do not live in this directory, and nothing
+here uses it.
 
-## 🤝 Attribution
+prost cannot read protobuf editions at all — it maps `syntax` onto a two-value
+enum and panics on anything else ([tokio-rs/prost#1031], open) — and 28 of the
+45 files are editions. So `build.rs` has protoc produce a descriptor set and
+rewrites each editions file's `syntax` to the pre-editions one with the same
+field-presence semantics: `proto3` for the six files that declare
+`features.field_presence = IMPLICIT`, `proto2` for the rest. That distinction
+matters on the wire — see `build.rs`, which spells out why, and the two
+per-field overrides neither syntax can express.
 
-This project is a Rust port of [chrome-lens-py](https://github.com/bropines/chrome-lens-py) by [bropines](https://github.com/bropines).
+protoc comes from `protoc-bin-vendored` rather than the host, so there is
+nothing to install and the version is pinned: an older protoc *skips* an
+editions file rather than failing, which is a silent way to ship stale code.
 
-## 🛠 Projects Used In
+### What the request was missing
 
-  * [Mangatan](https://github.com/KolbyML/Mangatan) - Easy to use all-in-one solution for reading Japanese manga with automatic OCR for seamless Yomitan lookups
+Measured against `create_ocr_translate_request` in chrome-lens-py. The fork did
+not send:
 
-## ⚖️ License
+- **`client_filters`.** Chromium always sends exactly one filter: `AUTO_FILTER`,
+  or `TRANSLATE` which *replaces* it and carries the target language. The fork
+  sent none — a state real Chrome never produces. It also meant translation was
+  unreachable: the fork read `deep_gleams[].translation`, but Lens only fills
+  that in when asked through the `TRANSLATE` filter, so `LensResult.translation`
+  could never be anything but `None`.
+- `request_id.time_usec`
+- `rendering_context.rendering_environment = RENDERING_ENV_LENS_OVERLAY`, which
+  is what Chromium pairs with `SURFACE_CHROMIUM`/`PLATFORM_WEB`.
 
-Distributed under the MIT License. See `LICENSE` for more information.
+An unset OCR language is now the empty string rather than `"en"`, because those
+are different requests and the empty one is what Chromium sends by default.
 
------
+### What the image handling was missing
 
-**Disclaimer:** This project is intended for educational and experimental purposes only. Use of Google's services must comply with their Terms of Service. The author is not responsible for any misuse of this software.
+| | before | now |
+|---|---|---|
+| when to downscale | either side over 1500 px | area over 1.5 MP **and** a side over 1600 px, which is `lens::ShouldDownscaleSize` |
+| upload format | always re-encoded PNG | JPEG at quality 40, `kLensOverlayImageCompressionQuality` |
+| transparency | flattened by the PNG encoder | kept, then flattened onto white or black by content luminance |
+
+The resize rule matters in both directions: a 1600x900 screenshot is under the
+area limit, so Chromium sends it untouched where the old rule shrank it and lost
+OCR detail. And PNG of a screenshot is several times the size of the equivalent
+JPEG, so the old encoding paid for every upload and got nothing back.
+
+The transparency choice is measured, not guessed: the server composites a
+transparent upload onto black, so black text on a transparent PNG reads back
+empty if the alpha survives, and white text vanishes if it is flattened onto
+white. Picking the background by luminance reads both. Pass
+`AlphaMode::Flatten` for the plain white behaviour.
+
+## Not implemented
+
+- Region OCR — OCR of a selection rather than the whole image
+  (`create_region_request` in chrome-lens-py).
+- Session continuity. `sequence_id`/`image_sequence_id` are 1 with a fresh uuid
+  per request; there is no follow-up interaction on the same image, and no
+  cookies.
+- Retries and rate limiting. chrome-lens-py holds a semaphore and retries on
+  429/5xx; a tight capture loop here will not.
+
+## Related
+
+- [chrome-lens-py](https://github.com/bropines/chrome-lens-py) — the Python
+  library and `lens_scan` CLI, with a warm daemon, ShareX integration and the
+  text renderer. The reference for what goes on the wire.
+- [chrome-lens-ocr](https://github.com/dimdenGD/chrome-lens-ocr) — dimdenGD's
+  JavaScript original, where the endpoint was first worked out.
+
+## Licence
+
+MIT, as the upstream fork is. Upstream's copyright notice is kept in
+[LICENSE](LICENSE) alongside this fork's.
+
+## Disclaimer
+
+This uses an undocumented Google endpoint and is not affiliated with or endorsed
+by Google. It can break without notice, Google's terms of service apply to how
+you use it, and images you scan are uploaded to Google's servers.
+
+[tokio-rs/prost#1031]: https://github.com/tokio-rs/prost/issues/1031

@@ -1,22 +1,58 @@
 [package]
 name = "chrome_lens_ocr"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/KolbyML/chrome-lens-ocr"
-description = "Port of chrome-lens-py used in Mangatan"
+repository = "https://github.com/bropines/chrome-lens-rs"
+description = "Google Lens OCR and translation through the Chromium crupload endpoint, generated from Chromium's own protos"
 rust-version = "1.90.0"
+exclude = ["test.png", ".github/"]
 
 [dependencies]
 anyhow = "1.0"
-bytes = "1"
-env_logger = "0.11"
 image = "0.25"
 log = "0.4"
 prost = "0.14"
 rand = "0.9"
-reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls", "http2"] }
-thiserror = "2.0"
-tokio = { version = "1", features = ["full"] }
-url = "2.4"
+reqwest = { version = "0.12", features = ["rustls-tls", "http2"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+
+# Only the binaries need these: env_logger for the CLI, serde_json for the
+# GitHub API responses that update-protos reads.
+[dependencies.env_logger]
+version = "0.11"
+optional = true
+
+[dependencies.serde_json]
+version = "1.0"
+optional = true
+
+[features]
+default = ["bin"]
+# The `chrome_lens_ocr` CLI and the `update-protos` tool. A library consumer
+# can switch this off (`default-features = false`) and skip their dependencies.
+bin = ["dep:env_logger", "dep:serde_json", "tokio/full"]
+
+[[bin]]
+name = "chrome_lens_ocr"
+path = "src/main.rs"
+required-features = ["bin"]
+
+[[bin]]
+name = "update-protos"
+path = "src/bin/update-protos.rs"
+required-features = ["bin"]
+
+[build-dependencies]
+# prost/prost-types are used to read protoc's descriptor set and rewrite the
+# `syntax` of editions files before prost-build sees it; build.rs explains why.
+prost = "0.14"
+prost-build = "0.14"
+prost-types = "0.14"
+# The protos declare `edition = "2023"`/`"2024"`, which protoc below 33 cannot
+# parse - and older protoc SKIPS such files rather than failing, which is how
+# the checked-in modules in chrome-lens-py went stale once before. Vendoring
+# protoc pins the one we compile with instead of trusting the host's.
+# 3.3 bundles protoc 36.2.
+protoc-bin-vendored = "3.3"
