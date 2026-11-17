@@ -1,0 +1,95 @@
+name: CI
+
+# Lint, test on the three platforms, and build on the rust-version Cargo.toml
+# declares. Replaces the two workflows inherited from upstream, which did not
+# check what they looked like they checked: `make fmt` *formatted* instead of
+# failing, cargo-udeps excluded an `ef-tests` crate this repository never had,
+# and the tests ran on Linux alone.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      # Stable rustfmt: rustfmt.toml has nightly-only options, which stable
+      # ignores with a warning, and the code is formatted with stable.
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      # Every feature set a consumer can pick: a cfg can hide a warning, or an
+      # error, from the default build. Glossa builds with no default features.
+      - name: clippy (default features)
+        run: cargo clippy --locked --all-targets --no-deps -- --deny warnings
+      - name: clippy (no default features)
+        run: cargo clippy --locked --lib --no-default-features --no-deps -- --deny warnings
+      - name: clippy (client only)
+        run: cargo clippy --locked --lib --no-default-features --features client --no-deps -- --deny warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # build.rs runs the protoc from protoc-bin-vendored on each platform, so
+      # this is also what proves the proto build works off Linux.
+      - name: cargo test
+        run: cargo test --locked
+
+  msrv:
+    name: builds on the declared rust-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+          rustup toolchain install "$msrv" --profile minimal
+
+      # --locked: the dependency versions in Cargo.lock are the ones that have
+      # to build on it, not whatever the registry has today.
+      - name: cargo build
+        run: cargo +"$MSRV" build --locked --all-targets

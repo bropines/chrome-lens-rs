@@ -1,0 +1,80 @@
+name: Proto drift
+
+# Weekly: would re-pinning to Chromium main change the vendored protos?
+#
+# It does not open a pull request, deliberately. Actions may not create one in
+# this repository, and a re-pin is not always mechanical: Chromium can add an
+# import from outside the directory (search_communication.proto picked up one
+# from third_party/omnibox_proto in d717a509) or a per-field presence override,
+# and each of those needs a decision. So this fails loudly, which mails the
+# owner, and a person runs the one command below and looks.
+#
+# chrome-lens-py's weekly workflow regenerates the Python side from the same
+# directory; the two should be re-pinned to the same commit.
+
+on:
+  schedule:
+    - cron: '0 3 * * 0' # Sundays, after chrome-lens-py's run
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # Fails by itself on an import that cannot be resolved, which is the
+      # case that needs a decision most.
+      - name: Re-pin to Chromium main
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo run --locked --quiet --bin update-protos -- --ref main
+
+      # build.rs fails if the per-field presence overrides moved.
+      - name: Still builds and passes
+        run: cargo test --locked --quiet
+
+      - name: Report
+        run: |
+          set -euo pipefail
+          pinned=$(git show HEAD:third_party/lens_server_proto/CHROMIUM_COMMIT)
+          latest=$(cat third_party/lens_server_proto/CHROMIUM_COMMIT)
+          # The pin file moves every week; only the protos themselves matter.
+          if git diff --quiet -- third_party/lens_server_proto \
+               ':(exclude)third_party/lens_server_proto/CHROMIUM_COMMIT' \
+             && [ -z "$(git ls-files --others --exclude-standard third_party/lens_server_proto)" ]; then
+            echo "Vendored protos match chromium@${latest:0:12} (pinned ${pinned:0:12})." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## Protos have drifted"
+            echo
+            echo "Pinned chromium@${pinned:0:12}; main is chromium@${latest:0:12}. Changed:"
+            echo
+            echo '```'
+            git status --short -- third_party/lens_server_proto
+            echo '```'
+            echo
+            echo "Re-pin locally, read the diff, and commit:"
+            echo
+            echo '```'
+            echo "cargo run --bin update-protos -- --ref ${latest}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          git status --short -- third_party/lens_server_proto
+          echo "::error::The vendored protos differ from Chromium main; see the job summary."
+          exit 1
