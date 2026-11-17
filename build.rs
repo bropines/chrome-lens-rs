@@ -15,8 +15,8 @@
 //! prost-build cannot read editions files at all: it maps `syntax` onto a
 //! two-value enum and panics with "unknown syntax: editions" on anything else
 //! (prost-build 0.14.4, `code_generator/syntax.rs`; tokio-rs/prost#1031 is open
-//! with no fix). 28 of the 45 Chromium files are editions, so that is not a
-//! corner we can avoid.
+//! with no fix). Most of the Chromium files are editions - the build prints
+//! how many on every run - so that is not a corner we can avoid.
 //!
 //! protoc itself understands them. So protoc produces a FileDescriptorSet, and
 //! we rewrite each editions file's `syntax` to the pre-editions syntax with the

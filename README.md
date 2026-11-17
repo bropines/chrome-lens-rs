@@ -103,16 +103,17 @@ cargo run --bin update-protos -- --ref main
 
 which resolves the ref to a commit, downloads the directory, checks that every
 import of every file resolves, drops files upstream has removed, and exits
-non-zero on any problem. `aim_communication.proto` is excluded, with the reason
-printed on every run: it imports protos from `third_party/omnibox_proto` and
-`components/optimization_guide` that do not live in this directory, and nothing
-here uses it.
+non-zero on any problem. Two files are excluded, each with its reason printed on
+every run: `aim_communication.proto` and `search_communication.proto` both
+import protos from `third_party/omnibox_proto` (and the first from
+`components/optimization_guide` too), which do not live in this directory, and
+nothing here uses either.
 
 prost cannot read protobuf editions at all — it maps `syntax` onto a two-value
-enum and panics on anything else ([tokio-rs/prost#1031], open) — and 28 of the
-45 files are editions. So `build.rs` has protoc produce a descriptor set and
+enum and panics on anything else ([tokio-rs/prost#1031], open) — and most of
+these files are editions. So `build.rs` has protoc produce a descriptor set and
 rewrites each editions file's `syntax` to the pre-editions one with the same
-field-presence semantics: `proto3` for the six files that declare
+field-presence semantics: `proto3` for the files that declare
 `features.field_presence = IMPLICIT`, `proto2` for the rest. That distinction
 matters on the wire — see `build.rs`, which spells out why, and the two
 per-field overrides neither syntax can express.

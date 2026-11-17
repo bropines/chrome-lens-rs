@@ -32,13 +32,21 @@ const PROTO_DIR: &str = "third_party/lens_server_proto";
 
 /// Files deliberately not vendored. Each entry carries a reason that is
 /// printed on every run, so an exclusion can never go unnoticed.
-const EXCLUDED: &[(&str, &str)] = &[(
-    "aim_communication.proto",
-    "imports tool_mode.proto, model_mode.proto (third_party/omnibox_proto) and \
-     actions_data.proto -> common_quality_data.proto (components/optimization_guide), \
-     none of which live in this directory; vendoring it would mean vendoring \
-     unrelated Chromium protos under their full import paths. The client never uses it.",
-)];
+const EXCLUDED: &[(&str, &str)] = &[
+    (
+        "aim_communication.proto",
+        "imports tool_mode.proto, model_mode.proto (third_party/omnibox_proto) and \
+         actions_data.proto -> common_quality_data.proto (components/optimization_guide), \
+         none of which live in this directory; vendoring it would mean vendoring \
+         unrelated Chromium protos under their full import paths. The client never uses it.",
+    ),
+    (
+        "search_communication.proto",
+        "imports input_type.proto (third_party/omnibox_proto, package omnibox) since \
+         chromium@d717a509 - the same directory aim_communication.proto reaches into, \
+         and excluded for the same reason. Nothing imports it and the client never uses it.",
+    ),
+];
 
 /// Imports that protoc resolves from its own bundled include directory.
 const WELL_KNOWN_PREFIX: &str = "google/protobuf/";
